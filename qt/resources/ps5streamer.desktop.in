@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=PS5 Streamer
+Comment=Intercept PS5 RTMP streams locally
+Exec=PS5Streamer
+Icon=network-wireless
+Terminal=false
+Categories=Network;AudioVideo;
+StartupNotify=true

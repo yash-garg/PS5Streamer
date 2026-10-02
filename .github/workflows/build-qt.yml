@@ -1,0 +1,190 @@
+name: Build Qt
+
+on:
+  push:
+    branches: [main, master]
+    paths:
+      - "qt/**"
+      - ".github/workflows/build-qt.yml"
+  pull_request:
+    paths:
+      - "qt/**"
+      - ".github/workflows/build-qt.yml"
+  workflow_dispatch:
+
+env:
+  NGINX_VERSION: "1.26.3"
+  NGINX_RTMP_REF: "master"
+  # Prebuilt nginx 1.28.1 + RTMP (static), Windows x64
+  NGINX_WIN_URL: "https://github.com/iliweii/nginx-rtmp-win64/releases/download/v1.0.0/nginx-rtmp-win64.zip"
+
+jobs:
+  linux:
+    name: Linux (Qt 5.15)
+    runs-on: ubuntu-22.04
+    defaults:
+      run:
+        working-directory: qt
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            cmake \
+            ninja-build \
+            qtbase5-dev \
+            qt5-qmake \
+            libqt5widgets5 \
+            libqt5network5 \
+            libpcre3-dev \
+            zlib1g-dev \
+            libssl-dev \
+            patchelf
+
+      - name: Configure
+        run: |
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX=install
+
+      - name: Build
+        run: cmake --build build --config Release
+
+      - name: Build portable nginx-rtmp
+        working-directory: ${{ github.workspace }}
+        run: |
+          set -euo pipefail
+          mkdir -p vendor
+          cd vendor
+          curl -fsSL "https://nginx.org/download/nginx-${NGINX_VERSION}.tar.gz" | tar xz
+          git clone --depth 1 --branch "${NGINX_RTMP_REF}" \
+            https://github.com/arut/nginx-rtmp-module.git
+          cd "nginx-${NGINX_VERSION}"
+          # Drop auth_basic to avoid a hard libcrypt.so.1 dependency on non-Ubuntu distros
+          ./configure \
+            --prefix=/tmp/ps5streamer-nginx \
+            --with-http_ssl_module \
+            --with-http_stub_status_module \
+            --without-http_auth_basic_module \
+            --add-module=../nginx-rtmp-module \
+            --without-http_upstream_zone_module \
+            --with-ld-opt="-Wl,-rpath,\$ORIGIN/lib"
+          make -j"$(nproc)"
+          make install
+          /tmp/ps5streamer-nginx/sbin/nginx -V 2>&1 | grep -qi rtmp
+
+          # Bundle shared libs next to the binary for Fedora/Arch/etc.
+          DEST="${GITHUB_WORKSPACE}/qt/dist/Binaries"
+          mkdir -p "${DEST}/lib"
+          cp /tmp/ps5streamer-nginx/sbin/nginx "${DEST}/nginx"
+          chmod +x "${DEST}/nginx"
+          ldd "${DEST}/nginx" | awk '/=>/ {print $3}' | while read -r lib; do
+            [ -z "$lib" ] && continue
+            case "$lib" in
+              */ld-linux*.so*) continue ;;
+              */libc.so*) continue ;;
+              */libm.so*) continue ;;
+              */libdl.so*) continue ;;
+              */libpthread.so*) continue ;;
+              */librt.so*) continue ;;
+              */libgcc_s.so*) continue ;;
+            esac
+            cp -L "$lib" "${DEST}/lib/" || true
+          done
+          # Always try to ship libcrypt if the linker still wants it
+          for cand in /lib/x86_64-linux-gnu/libcrypt.so.1 /usr/lib/x86_64-linux-gnu/libcrypt.so.1; do
+            [ -f "$cand" ] && cp -L "$cand" "${DEST}/lib/" && break || true
+          done
+          patchelf --set-rpath '$ORIGIN/lib' "${DEST}/nginx"
+          echo "Bundled libs:" && ls -la "${DEST}/lib"
+          ldd "${DEST}/nginx" || true
+
+      - name: Package
+        run: |
+          mkdir -p dist
+          cp build/PS5Streamer dist/
+          # Binaries/ filled by nginx step
+          test -x dist/Binaries/nginx
+          cp ../THIRD_PARTY_NGINX.md dist/ 2>/dev/null || true
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: PS5Streamer-linux-x64
+          path: qt/dist/
+
+  windows:
+    name: Windows (Qt 5.15)
+    runs-on: windows-2022
+    defaults:
+      run:
+        working-directory: qt
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Qt 5.15
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: "5.15.2"
+          host: windows
+          target: desktop
+          arch: win64_msvc2019_64
+          cache: true
+          extra: "--base https://mirrors.dotsrc.org/qtproject"
+
+      - name: Configure
+        shell: pwsh
+        run: |
+          cmake -S . -B build -G "Visual Studio 17 2022" -A x64 `
+            -DCMAKE_BUILD_TYPE=Release `
+            -DCMAKE_PREFIX_PATH="$env:QT_ROOT_DIR"
+
+      - name: Build
+        shell: pwsh
+        run: cmake --build build --config Release
+
+      - name: Deploy Qt runtime
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Copy-Item build/Release/PS5Streamer.exe dist/
+          & "$env:QT_ROOT_DIR/bin/windeployqt.exe" `
+            --release --no-translations --no-opengl-sw `
+            dist/PS5Streamer.exe
+
+      - name: Bundle nginx-rtmp
+        shell: pwsh
+        working-directory: ${{ github.workspace }}
+        run: |
+          $zip = "nginx-rtmp-win64.zip"
+          Invoke-WebRequest -Uri $env:NGINX_WIN_URL -OutFile $zip
+          Expand-Archive -Path $zip -DestinationPath nginx-rtmp-extract -Force
+          $nginxExe = Get-ChildItem -Path nginx-rtmp-extract -Recurse -Filter nginx.exe |
+            Select-Object -First 1
+          if (-not $nginxExe) { throw "nginx.exe not found in downloaded archive" }
+          $srcRoot = $nginxExe.Directory.FullName
+          $dest = "qt/dist/Binaries"
+          New-Item -ItemType Directory -Force -Path $dest | Out-Null
+          Copy-Item "$srcRoot/nginx.exe" "$dest/nginx.exe"
+          foreach ($dir in @("conf", "logs", "temp", "html")) {
+            $from = Join-Path $srcRoot $dir
+            if (Test-Path $from) {
+              Copy-Item $from (Join-Path $dest $dir) -Recurse -Force
+            } else {
+              New-Item -ItemType Directory -Force -Path (Join-Path $dest $dir) | Out-Null
+            }
+          }
+          if (Test-Path THIRD_PARTY_NGINX.md) {
+            Copy-Item THIRD_PARTY_NGINX.md qt/dist/
+          }
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: PS5Streamer-windows-x64
+          path: qt/dist/

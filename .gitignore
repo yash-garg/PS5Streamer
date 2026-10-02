@@ -14,6 +14,15 @@ playground.xcworkspace
 # ── Build output ─────────────────────────────────────────────────────────────
 build/
 DerivedData/
+qt/build/
+qt/install/
+qt/dist/
+PS5Streamer-linux-x64.tar.gz
+PS5Streamer-windows-x64.zip
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+compile_commands.json
 
 # ── macOS ────────────────────────────────────────────────────────────────────
 .DS_Store
@@ -34,3 +43,6 @@ PS5Streamer/Resources/Binaries/
 
 # App runtime files — generated at runtime in ~/.ps5streamer
 .ps5streamer/
+
+# aqtinstall / local Qt tooling
+aqtinstall.log
